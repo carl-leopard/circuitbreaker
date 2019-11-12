@@ -2,7 +2,7 @@ package breaker
 
 import (
 	"errors"
-	"sync"
+	"fmt"
 	"sync/atomic"
 	"time"
 )
@@ -13,14 +13,8 @@ var (
 		ErrorThresholdPercent:  20,
 		RequestVolumeThreshold: 1000,
 
-		errorVolumeThreshold: uint32(float32(1000) * float32(0.8)),
+		errorVolumeThreshold: uint32(float32(1000) * (float32(20) / float32(100))),
 	}
-
-	// defaultCloseConfig = CircuitBreakerCloseConfig{
-	// 	SuccessThresholdPercent: 85,
-	// 	RecoveryInterval:        30 * 1000,
-	// 	SuccessVolumeThreshold:  100,
-	// }
 
 	defaultCloseConfig = CircuitBreakerCloseConfig{
 		RecoveryInterval:       time.Minute,
@@ -29,28 +23,13 @@ var (
 )
 
 var (
-	ErrTooManyErrors           = errors.New("too many errors")
-	ErrorManualDroppingRequest = errors.New("manual dropping requests")
+	errTooManyErrors        = errors.New("too many errors")
+	errCircuitBreakerClosed = errors.New("circult breaker is closed")
 )
 
-const (
-	minRefreshInterval = time.Minute
-	maxRefreshInterval = time.Minute * 5
-
-	minSleepWindow = time.Second * 15
-	maxSleepWindow = minRefreshInterval
-
-	minRecoveryInterval = time.Second * 30
-	maxRecoveryInterval = maxRefreshInterval
+var (
+	errUnknownStatus = errors.New("unknown status")
 )
-
-// type CircuitBreakerStatus int32
-
-// const (
-// 	CircuitBreakerStatusClosed CircuitBreakerStatus = iota + 1
-// 	CircuitBreakerStatusOpen
-// 	CircuitBreakerStatusHalfOpen
-// )
 
 const (
 	CircuitBreakerStatusClosed int32 = iota + 1
@@ -69,17 +48,8 @@ type CircuitBreakerOpenConfig struct {
 	ErrorThresholdPercent  uint8         //circuitBreaker turns to open when errors up to it in refresh interval. take effect with RequestVolumeThreshold
 	RequestVolumeThreshold uint32        //circuitBreaker turns to open when errors up to ErrorThresholdPercent and volume comes to it. take effect with ErrorThresholdPercent
 
-	errorVolumeThreshold uint32 //RequestVolumeThreshold * (ErrorThresholdPercent / 100)
+	errorVolumeThreshold uint32 //RequestVolumeThreshold * (ErrorThresholdPercent / 100), use to accelerate compare when status is closed
 }
-
-//CircuitBreakerCloseConfig case in which circuit breaker turns to closed
-// type CircuitBreakerCloseConfig struct {
-// 	RecoveryInterval        time.Duration
-// 	SuccessThresholdPercent uint8  //circuitBreaker turns to closed when successes up to it in refresh interval. take effect with SuccessVolumeThreshold
-// 	SuccessVolumeThreshold  uint32 //circuitBreaker turns to closed when successes up to SuccessThresholdPercent and volume comes to it. take effect with SuccessThresholdPercent
-
-// 	successVolumeThreshold uint32 //SuccessVolumeThreshold * (SuccessThresholdPercent / 100)
-// }
 
 //CircuitBreakerCloseConfig case in which circuit breaker turns to closed.
 type CircuitBreakerCloseConfig struct {
@@ -89,33 +59,26 @@ type CircuitBreakerCloseConfig struct {
 
 type CircuitBreakerOption func(c *CircuitBreaker)
 
-func SetOpenConfig(oc CircuitBreakerOpenConfig) CircuitBreakerOption {
+func WithOpenConfig(oc CircuitBreakerOpenConfig) CircuitBreakerOption {
 	return func(c *CircuitBreaker) {
-		if oc.RefreshInterval >= minRefreshInterval && oc.RefreshInterval <= maxRefreshInterval {
-
-			oc.errorVolumeThreshold = uint32(float32(oc.RequestVolumeThreshold) * (float32(oc.ErrorThresholdPercent) / float32(100)))
-			c.openConfig = oc
-		}
+		oc.errorVolumeThreshold = uint32(float32(oc.RequestVolumeThreshold) * (float32(oc.ErrorThresholdPercent) / float32(100)))
+		c.openConfig = oc
 	}
 }
 
-func SetCloseConfig(cc CircuitBreakerCloseConfig) CircuitBreakerOption {
+func WithCloseConfig(cc CircuitBreakerCloseConfig) CircuitBreakerOption {
 	return func(c *CircuitBreaker) {
-		if cc.RecoveryInterval >= minRecoveryInterval && cc.RecoveryInterval <= maxRecoveryInterval {
-			c.closeConfig = cc
-		}
+		c.closeConfig = cc
 	}
 }
 
-func SetSleepWindow(t time.Duration) CircuitBreakerOption {
+func WithSleepWindow(t time.Duration) CircuitBreakerOption {
 	return func(c *CircuitBreaker) {
-		if t >= minSleepWindow && t <= maxSleepWindow {
-			c.sleepWindow = t
-		}
+		c.sleepWindow = t
 	}
 }
 
-func SetCallback(f func()) CircuitBreakerOption {
+func WithCallback(f func()) CircuitBreakerOption {
 	return func(c *CircuitBreaker) {
 		if f != nil {
 			c.callback = f
@@ -138,12 +101,7 @@ type CircuitBreaker struct {
 
 	callback func() //callback when circuitBreak turns to open from closed or to closed from half-open
 
-	start     time.Time //start of statistical period
-	eventTime time.Time //last time at which circuit breaker is open
-
-	//     chan struct{}
-	//stopOnce *sync.Once
-	mu sync.Mutex
+	closeChan chan struct{}
 }
 
 //New return a new citcuit breaker
@@ -161,9 +119,7 @@ func New(opts ...CircuitBreakerOption) *CircuitBreaker {
 
 		callback: nil,
 
-		start: time.Now(),
-
-		//stopOnce: new(sync.Once),
+		closeChan: make(chan struct{}),
 	}
 
 	for _, opt := range opts {
@@ -175,37 +131,61 @@ func New(opts ...CircuitBreakerOption) *CircuitBreaker {
 	return c
 }
 
-//Stop closes circuit breaker
-func (c *CircuitBreaker) Stop() {
-	atomic.StoreInt32(&c.status, CircuitBreakerStatusClosed)
+//Close closes circuit breaker
+func (c *CircuitBreaker) Close() {
+	close(c.closeChan)
 }
 
 //ReportRequest is a short hand of ReportRequestN, call when receive a request
 func (c *CircuitBreaker) ReportRequest() error {
-	return c.ReportRequestN(1, time.Now())
+	select {
+	case <-c.closeChan:
+		return errCircuitBreakerClosed
+	default:
+	}
+
+	return c.ReportRequestN(1)
 }
 
 //ReportRequestN calculates reuqests
-func (c *CircuitBreaker) ReportRequestN(n uint32, now time.Time) error {
-	return nil
+func (c *CircuitBreaker) ReportRequestN(n uint32) error {
+	select {
+	case <-c.closeChan:
+		return errCircuitBreakerClosed
+	default:
+	}
+
+	return c.addRequest(n)
 }
 
-//ReportError is a short hand of ReportErrorN, call when receive no response from backend
+//ReportError is a short hand of ReportErrorN, call when receiving no response from backend or other define error
 func (c *CircuitBreaker) ReportError() error {
-	return c.ReportErrorN(1, time.Now())
+	select {
+	case <-c.closeChan:
+		return errCircuitBreakerClosed
+	default:
+	}
+
+	return c.ReportErrorN(1)
 }
 
 //ReportErrorN calculates error reuqests
-func (c *CircuitBreaker) ReportErrorN(n uint32, now time.Time) error {
+func (c *CircuitBreaker) ReportErrorN(n uint32) error {
+	select {
+	case <-c.closeChan:
+		return errCircuitBreakerClosed
+	default:
+	}
 
+	c.addErrorRequest(n)
 	return nil
 }
 
-func (c *CircuitBreaker) addRequest(n uint32, now time.Time) error {
+func (c *CircuitBreaker) addRequest(n uint32) error {
 	status := atomic.LoadInt32(&c.status)
 	switch status {
 	case CircuitBreakerStatusOpen:
-		return ErrTooManyErrors
+		return errTooManyErrors
 	case CircuitBreakerStatusHalfOpen:
 		//pass request to backend
 
@@ -214,33 +194,44 @@ func (c *CircuitBreaker) addRequest(n uint32, now time.Time) error {
 		//pass all
 
 		atomic.StoreUint32(&c.requestVolume, atomic.AddUint32(&c.requestVolume, n))
+	default:
+		panic(errUnknownStatus)
 	}
 
 	return nil
 }
 
-func (c *CircuitBreaker) addErrorRequest(n uint32, now time.Time) error {
-	//half open => open
-	if atomic.LoadInt32(&c.status) == CircuitBreakerStatusHalfOpen {
-		atomic.StoreInt32(&c.status, CircuitBreakerStatusOpen)
-		go c.waitForSleepWindow()
-		return nil
+func (c *CircuitBreaker) addErrorRequest(n uint32) {
+	if n == 0 {
+		return
 	}
 
-	v := atomic.AddUint32(&c.errorVolume, n)
-
-	//closed => open
-	if v >= c.openConfig.errorVolumeThreshold &&
-		atomic.LoadUint32(&c.openConfig.RequestVolumeThreshold) <= atomic.LoadUint32(&c.requestVolume) &&
-		v >= uint32(float32(atomic.LoadUint32(&c.requestVolume))*(float32(c.openConfig.ErrorThresholdPercent)/float32(100))) {
+	status := atomic.LoadInt32(&c.status)
+	switch status {
+	case CircuitBreakerStatusOpen:
+		//skip
+	case CircuitBreakerStatusHalfOpen:
 		atomic.StoreInt32(&c.status, CircuitBreakerStatusOpen)
-		go c.waitForSleepWindow()
-		return nil
-	}
 
-	//stay closed
-	atomic.StoreUint32(&c.errorVolume, v)
-	return nil
+		go c.waitForSleepWindow()
+	case CircuitBreakerStatusClosed:
+		v := atomic.AddUint32(&c.errorVolume, n)
+
+		//closed => open
+		if v >= c.openConfig.errorVolumeThreshold &&
+			atomic.LoadUint32(&c.openConfig.RequestVolumeThreshold) <= atomic.LoadUint32(&c.requestVolume) &&
+			v >= c.getCurErrorQuorm() {
+			atomic.StoreInt32(&c.status, CircuitBreakerStatusOpen)
+
+			go c.waitForSleepWindow()
+			return
+		}
+
+		//stay closed
+		atomic.StoreUint32(&c.errorVolume, v)
+	default:
+		panic(errUnknownStatus)
+	}
 }
 
 func (c *CircuitBreaker) resetRefreshInterval() {
@@ -250,15 +241,30 @@ func (c *CircuitBreaker) resetRefreshInterval() {
 		case <-t.C:
 			atomic.StoreUint32(&c.requestVolume, 0)
 			atomic.StoreUint32(&c.errorVolume, 0)
+		case <-c.closeChan:
+			fmt.Println("circuit breaker has already exited")
+
+			t.Stop()
+			return
 		}
 	}
 }
 
 func (c *CircuitBreaker) waitForSleepWindow() {
-	select {
-	case <-time.After(c.sleepWindow):
-		atomic.StoreInt32(&c.status, CircuitBreakerStatusHalfOpen)
-	}
+	timer := time.NewTimer(c.sleepWindow)
 
-	return
+	select {
+	case <-timer.C:
+		atomic.StoreInt32(&c.status, CircuitBreakerStatusHalfOpen)
+
+		timer.Stop()
+	case <-c.closeChan:
+		fmt.Println("circuit breaker has already exited")
+
+		timer.Stop()
+	}
+}
+
+func (c *CircuitBreaker) getCurErrorQuorm() uint32 {
+	return uint32(float32(atomic.LoadUint32(&c.requestVolume)) * (float32(c.openConfig.ErrorThresholdPercent) / float32(100)))
 }
